@@ -79,7 +79,7 @@ class ScenarioTests(unittest.TestCase):
         scenario.write_text(json.dumps({'scenarios':[{'model':f'Qwen/Qwen2.5-{i+1}B-Instruct','tp':1,'dtype':'bfloat16','workloads':['LLM.mixed','LLM.long_context','LLM.single_request']} for i in range(rows)]}))
         args=['--scenarios',str(scenario),'--fk-repo',str(REPO),'--baseline-python','/baseline','--candidate-python','/candidate','--workdir',str(p/'results'),'--data-root',str(p/'data'),'--repeats','1','--latency-iters','2','--min-free-gb','0']
         def hardware(command,**kw):return '' if '--query-compute-apps=pid' in command else 'GPU-test, H100, 80000, driver\n'
-        def environment(py,*a):return {'vllm':'0.28.0' if str(py)=='/candidate' else '0.26.0','pin_memory':True,'packages':[('torch','2.11.0'),('vllm','0.26.0'),('transformers','5.14.1')]}
+        def environment(py,*a):return {'vllm':'0.18.0' if str(py)=='/baseline' else '0.26.0','pin_memory':True,'packages':[('torch','2.11.0'),('vllm','0.26.0'),('transformers','5.14.1')]}
         with patch.object(suite,'inherit_hf_auth'),patch.object(suite,'run_command',side_effect=self.fake_run),patch.object(suite,'environment_identity',side_effect=environment),patch.object(suite,'source_identity',return_value={'sha256':'fixed'}),patch.object(suite.subprocess,'check_output',side_effect=hardware):
             rc=suite.main(args+list(extra))
         return rc,json.loads((p/'results/status.json').read_text())

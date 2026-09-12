@@ -79,8 +79,12 @@ def run_worker(
         f.write(
             "import os as _fk_os, sys as _fk_sys, traceback as _fk_tb\n"
             "def _fk_excepthook(typ, val, tb):\n"
-            "    _fk_tb.print_exception(typ, val, tb)\n"
-            "    _fk_os._exit(1)\n"
+            "    try:\n"
+            "        _fk_tb.print_exception(typ, val, tb, file=_fk_sys.__stderr__)\n"
+            "        _fk_sys.__stderr__.flush()\n"
+            "        _fk_sys.__stdout__.flush()\n"
+            "    finally:\n"
+            "        _fk_os._exit(1)\n"
             "_fk_sys.excepthook = _fk_excepthook\n"
         )
         f.write(script)
@@ -130,4 +134,3 @@ def run_worker(
         os.unlink(config_path)
         if os.path.exists(output_path):
             os.unlink(output_path)
-

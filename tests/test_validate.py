@@ -65,6 +65,30 @@ def test_fatal_worker_line_ignores_vllm_warning_tracebacks():
     ) is True
 
 
+def test_worker_exception_survives_redirected_stderr(capfd):
+    from fastkernels.validate.worker import run_worker
+    result = run_worker('import sys, io\nsys.stderr = io.StringIO()\nraise RuntimeError("worker failure evidence")', {}, 'failure test', timeout=10)
+    assert result is None
+    captured = capfd.readouterr()
+    assert 'RuntimeError: worker failure evidence' in captured.err
+
+
+def test_codestral_state_capacity_default_for_hopper_and_blackwell():
+    import ast
+    source = Path('fastkernels/validate/bench_vllm.py').read_text()
+    tree = ast.parse(source)
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
+             ('_is_pure_mamba_model', '_default_mamba_max_num_seqs')]
+    scope = {'_HOPPER_MAMBA_MAX_NUM_SEQS':512}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<capacity>', 'exec'), scope)
+    default = scope['_default_mamba_max_num_seqs']
+    for cc in (9,10):
+        assert default('/cache/models--mistralai--Mamba-Codestral-7B-v0.1/snapshots/sha',cc) == 64
+    assert default('state-spaces/mamba-2.8b-hf',9) == 512
+    assert default('state-spaces/mamba-2.8b-hf',10) is None
+    assert default('ai21labs/AI21-Jamba-Mini-1.7',9) is None
+
+
 def test_build_vllm_command_forwards_supported_options(tmp_path):
     cmd = _build_cmd(
         _scenario("meta-llama/Llama-3.1-8B-Instruct", tp=2),
@@ -1145,3 +1169,164 @@ def test_sam_worker_sources_have_no_undefined_names():
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
         }
         assert not (used - defined), f"{name} uses undefined {sorted(used - defined)}"
+
+
+def test_text_audit_options_reach_harness(tmp_path):
+    cmd = _build_cmd(
+        _scenario('Qwen/Qwen2.5-7B-Instruct'), 'bench_vllm',
+        _args(text_scenario='mixed', inputs_json='/tmp/frozen.json', seed=17,
+              latency_iters=3, reference_patches='off', skip_latency=True), tmp_path,
+    )
+    for flag, value in [('--scenario', 'mixed'), ('--inputs-json', '/tmp/frozen.json'),
+                        ('--seed', '17'), ('--latency-iters', '3'),
+                        ('--reference-patches', 'off')]:
+        assert cmd[cmd.index(flag) + 1] == value
+    assert '--skip-latency' in cmd
+
+
+def test_frozen_inputs_reject_multiple_cli_jobs(tmp_path, capsys):
+    from fastkernels.validate import main
+    table = tmp_path / 'scenarios.yaml'
+    table.write_text(json.dumps({'scenarios': [
+        {'model': 'Qwen/Qwen2.5-7B-Instruct', 'tp': 1, 'dtype': 'bfloat16',
+         'legacy_workloads': ['mixed']},
+    ] * 2}))
+    assert main([str(table), '--save-inputs-json', str(tmp_path / 'frozen.json'),
+                 '--dry-run']) == 2
+    assert 'exactly one' in capsys.readouterr().err
+
+
+def test_cli_dry_run_forwards_frozen_inputs(tmp_path, capsys):
+    from fastkernels.validate import main
+    model = tmp_path / 'dense-model'
+    model.mkdir()
+    (model / 'config.json').write_text(json.dumps({'model_type': 'qwen2'}))
+    table = tmp_path / 'scenarios.yaml'
+    table.write_text(json.dumps({'scenarios': [
+        {'model': str(model), 'tp': 1, 'dtype': 'bfloat16',
+         'legacy_workloads': ['mixed', 'single-request', 'fixed-batch-32']},
+    ]}))
+    frozen = tmp_path / 'frozen.json'
+    assert main([str(table), '--save-inputs-json', str(frozen), '--text-scenario',
+                 'mixed', '--vllm-python', '/opt/new/bin/python', '--dry-run']) == 0
+    out = capsys.readouterr().out
+    assert 'fastkernels.validate.bench_vllm' in out
+    assert '--save-inputs-json ' + str(frozen) in out
+    assert '--scenario mixed' in out
+    assert '--vllm-python /opt/new/bin/python' in out
+
+@pytest.mark.parametrize("has_ipc_socket", [False, True])
+def test_flashinfer_socket_namespace_handles_old_and_new_api(monkeypatch, has_ipc_socket):
+    """Tolerate the removed API while preserving namespacing on older versions."""
+    import ast
+    import os
+    import sys
+    from types import ModuleType
+
+    source = Path(__file__).parents[1] / "fastkernels/validate/bench_vllm.py"
+    snippets = []
+    for node in ast.walk(ast.parse(source.read_text())):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        if "mnnvl.IpcSocket" not in node.value:
+            continue
+        tree = ast.parse(node.value)
+        functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                     and n.name == "_configure_parallel_safe_flashinfer"]
+        if functions:
+            snippets.append(ast.Module(body=functions, type_ignores=[]))
+        else:
+            block = next(n for n in tree.body if isinstance(n, ast.If)
+                         and isinstance(n.test, ast.Name) and n.test.id == "namespace")
+            snippets.append(ast.Module(body=[block], type_ignores=[]))
+    assert len(snippets) == 4
+    monkeypatch.setenv("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE", "test-run")
+    for snippet in snippets:
+        mnnvl = ModuleType("flashinfer.comm.mnnvl")
+        if has_ipc_socket:
+            class IpcSocket:
+                def __init__(self, rank, op_id, use_abstract=True):
+                    self.args = (rank, op_id, use_abstract)
+            mnnvl.IpcSocket = IpcSocket
+        comm = ModuleType("flashinfer.comm")
+        comm.mnnvl = mnnvl
+        monkeypatch.setitem(sys.modules, "flashinfer.comm", comm)
+        scope = {"os": os, "namespace": "test-run"}
+        code = compile(snippet, "<socket-workaround>", "exec")
+        exec(code, scope)
+        configure = scope.get("_configure_parallel_safe_flashinfer")
+        if configure:
+            configure()
+        if has_ipc_socket:
+            first = mnnvl.IpcSocket(1, 7, False).args
+            assert first[0] == 1 and first[1] != 7 and first[2] is False
+            if configure:
+                configure()
+            else:
+                exec(code, scope)
+            assert mnnvl.IpcSocket(1, 7, False).args == first
+
+
+def test_vllm_workload_selection_and_engine_settings_forwarded(tmp_path):
+    from fastkernels.workloads import BenchmarkScenario
+    s = BenchmarkScenario('meta-llama/Llama-3.1-8B-Instruct', 1, 'bfloat16',
+                          [LLM.long_context, LLM.single_request], max_num_seqs=16)
+    cmd = _build_cmd(s, 'bench_vllm', SimpleNamespace(warmup_iters=2), tmp_path)
+    assert cmd[cmd.index('--workloads')+1] == 'long-context,single-request'
+    assert cmd[cmd.index('--warmup-iters')+1] == '2'
+    assert cmd[cmd.index('--max-num-seqs')+1] == '16'
+    assert cmd[cmd.index('--dtype')+1] == 'bfloat16'
+
+
+def test_all_worker_variants_warm_full_generate_before_timer():
+    import ast
+    source = Path(__file__).parents[1] / 'fastkernels/validate/bench_vllm.py'
+    strings = {}
+    checked = 0
+    for assignment in ast.parse(source.read_text()).body:
+        if not isinstance(assignment, ast.Assign) or not isinstance(assignment.targets[0], ast.Name):
+            continue
+        try:
+            value = eval(compile(ast.Expression(assignment.value), '<constant>', 'eval'),
+                         {'__builtins__': {}}, strings)
+        except Exception:
+            continue
+        if not isinstance(value, str):
+            continue
+        name = assignment.targets[0].id
+        strings[name] = value
+        if not name.endswith('_WORKER'):
+            continue
+        tree = ast.parse(value)
+        compile(tree, name, 'exec')
+        for parent in ast.walk(tree):
+            for _, statements in ast.iter_fields(parent):
+                if not isinstance(statements, list):
+                    continue
+                for i, node in enumerate(statements):
+                    if not isinstance(node, ast.For) or not isinstance(node.target, ast.Name) or node.target.id != '_warmup_index':
+                        continue
+                    end = next(j for j in range(i+1, len(statements))
+                               if isinstance(statements[j], ast.Assign)
+                               and isinstance(statements[j].targets[0], ast.Name)
+                               and statements[j].targets[0].id == 'elapsed')
+                    block = ast.Module(body=statements[i:end+1], type_ignores=[])
+                    events = []
+                    def generate(*a, **kw):
+                        events.append(('generate', kw.get('use_tqdm')))
+                        return []
+                    def timer():
+                        events.append(('timer', None))
+                        return len(events)
+                    scope = {n.id: [] for n in ast.walk(block) if isinstance(n, ast.Name)}
+                    scope.update(cfg={'warmup_iters': 2}, range=range, hasattr=hasattr,
+                                 engine=SimpleNamespace(generate=generate, block_manager=SimpleNamespace(reset=lambda:None)),
+                                 llm=SimpleNamespace(generate=generate),
+                                 torch=SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda:None)),
+                                 time=SimpleNamespace(perf_counter=timer),
+                                 prefill_kw={}, generate_kwargs={})
+                    exec(compile(block, name, 'exec'), scope)
+                    assert [e[0] for e in events] == ['generate','generate','timer','generate','timer']
+                    assert events[0][1] is not True and events[1][1] is not True
+                    checked += 1
+    assert checked == 8

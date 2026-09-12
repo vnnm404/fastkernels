@@ -1,0 +1,7 @@
+results/
+overnight*/
+experiments/
+*.log
+*.env.sh
+hf-token
+token

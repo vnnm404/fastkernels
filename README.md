@@ -6,6 +6,9 @@ Operators are organized into four levels of abstraction (L1 single-kernel, L2 fu
 
 ## Quick Start
 
+For paired vLLM release comparisons, see the [version-drift audit guide](drift-audit/README.md)
+for environment setup, the overnight launcher, and resumable Markdown reports.
+
 Requires Python 3.10+, CUDA 12+, and a recent NVIDIA GPU (Hopper / Blackwell tested; Ampere supported for a subset of kernels).
 
 ```bash

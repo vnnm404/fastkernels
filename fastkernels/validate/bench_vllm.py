@@ -88,6 +88,21 @@ _JAMBA_MAX_NUM_SEQS = 256
 _HOPPER_MAMBA_MAX_NUM_SEQS = 512
 
 
+def _default_mamba_max_num_seqs(model_name: str, cc_major: int | None) -> int | None:
+    # Codestral has 64 layers of (128 heads, 64 head dim, 128 state size).
+    # Its FP32 recurrent state alone costs 256 MiB per sequence: 512 slots
+    # require 128 GiB before weights, convolution state, or CUDA graphs.
+    # vLLM 0.18 profiles graphs up to 2*max_num_seqs, so use 64 slots:
+    # the profiling cache then needs 32 GiB, leaving room on an 80 GiB H100.
+    # Use the same explicit capacity on both engines; requests still queue
+    # normally and the declared workloads/token budgets are unchanged.
+    if "mamba-codestral" in model_name.lower():
+        return 64
+    if _is_pure_mamba_model(model_name) and cc_major == 9:
+        return _HOPPER_MAMBA_MAX_NUM_SEQS
+    return None
+
+
 def _parse_port_env(name: str) -> int | None:
     value = os.environ.get(name)
     if value is None or value == "":
@@ -283,7 +298,7 @@ if namespace:
     except Exception:
         pass
     else:
-        if not getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
+        if hasattr(mnnvl, "IpcSocket") and not getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
             original_init = mnnvl.IpcSocket.__init__
             namespace_bits = int.from_bytes(
                 hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
@@ -829,7 +844,7 @@ def _configure_parallel_safe_flashinfer():
         from flashinfer.comm import mnnvl
     except Exception:
         return
-    if getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
+    if not hasattr(mnnvl, "IpcSocket") or getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
         return
 
     original_init = mnnvl.IpcSocket.__init__
@@ -892,6 +907,8 @@ def main():
             "video": 0,
             "audio": 0,
         }
+    if cfg.get("dtype"):
+        llm_kwargs["dtype"] = cfg["dtype"]
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("kv_cache_dtype"):
@@ -938,6 +955,9 @@ def main():
                            max_tokens=1, detokenize=False),
             use_tqdm=False,
         )
+        for _warmup_index in range(cfg.get("warmup_iters", 1)):
+            _warmup_outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=False)
+            del _warmup_outputs
         start = time.perf_counter()
         outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=True)
         elapsed = time.perf_counter() - start
@@ -954,6 +974,7 @@ def main():
         result = {
             "name": scenario["name"],
             "elapsed": elapsed,
+            "warmup_iters": cfg.get("warmup_iters", 1),
             "total_prompt_tokens": total_prompt_tokens,
             "total_output_tokens": total_output_tokens,
             "outputs": [
@@ -1032,6 +1053,9 @@ def main():
         )
         if "max_model_len" in cfg:
             engine_kwargs["max_model_len"] = cfg["max_model_len"]
+        if cfg.get("dtype"):
+            import torch
+            engine_kwargs["dtype"] = getattr(torch, cfg["dtype"])
         engine = Engine(**engine_kwargs)
     else:
         mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
@@ -1052,6 +1076,9 @@ def main():
             engine_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
         if "max_num_seqs" in cfg:
             engine_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
+        if cfg.get("dtype"):
+            import torch
+            engine_kwargs["dtype"] = getattr(torch, cfg["dtype"])
         engine = Engine(**engine_kwargs)
 
     # Warmup -- same 16-token prompt as the vLLM worker, so both sides enter
@@ -1097,6 +1124,17 @@ def main():
 
         engine.block_manager.reset()
         torch.cuda.synchronize()
+        for _warmup_index in range(cfg.get("warmup_iters", 1)):
+            _warmup_outputs = engine.generate(
+                prompts,
+                sp_list,
+                use_tqdm=False,
+                **prefill_kw,
+            )
+            torch.cuda.synchronize()
+            del _warmup_outputs
+        if hasattr(engine, "block_manager"):
+            engine.block_manager.reset()
         start = time.perf_counter()
         outputs = engine.generate(
             prompts,
@@ -1113,6 +1151,7 @@ def main():
         result = {
             "name": scenario["name"],
             "elapsed": elapsed,
+            "warmup_iters": cfg.get("warmup_iters", 1),
             "total_input_tokens": total_input_tokens,
             "total_output_tokens": total_output_tokens,
             "outputs": [
@@ -1279,6 +1318,9 @@ def _load_video_opencv(video_path, num_frames=32):
     return frames, metadata
 
 
+from fastkernels.validate.media_inputs import frozen_media
+
+@frozen_media
 def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
                      num_video_frames=32):
     """Pre-download and load multimodal samples into memory.
@@ -1486,7 +1528,7 @@ def _configure_parallel_safe_flashinfer():
         from flashinfer.comm import mnnvl
     except Exception:
         return
-    if getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
+    if not hasattr(mnnvl, "IpcSocket") or getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
         return
 
     original_init = mnnvl.IpcSocket.__init__
@@ -1560,6 +1602,8 @@ def main():
     if cfg["tp"] > 1:
         # See the LLM worker: keep multi-GPU off vLLM's ray executor.
         llm_kwargs["distributed_executor_backend"] = "mp"
+    if cfg.get("dtype"):
+        llm_kwargs["dtype"] = cfg["dtype"]
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("kv_cache_dtype"):
@@ -1599,6 +1643,9 @@ def main():
                                max_tokens=1),
                 use_tqdm=False,
             )
+            for _warmup_index in range(cfg.get("warmup_iters", 1)):
+                _warmup_outputs = llm.generate(vllm_prompts, sp_list)
+                del _warmup_outputs
             start = time.perf_counter()
             outputs = llm.generate(vllm_prompts, sp_list)
             elapsed = time.perf_counter() - start
@@ -1646,6 +1693,9 @@ def main():
                                max_tokens=1),
                 use_tqdm=False,
             )
+            for _warmup_index in range(cfg.get("warmup_iters", 1)):
+                _warmup_outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=False)
+                del _warmup_outputs
             start = time.perf_counter()
             outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=True)
             elapsed = time.perf_counter() - start
@@ -1661,6 +1711,7 @@ def main():
         result = {
             "name": scenario["name"],
             "elapsed": elapsed,
+            "warmup_iters": cfg.get("warmup_iters", 1),
             "total_prompt_tokens": total_prompt_tokens,
             "total_output_tokens": total_output_tokens,
             "outputs": [
@@ -1775,6 +1826,9 @@ def main():
         engine_kwargs["max_model_len"] = cfg["max_model_len"]
     if "max_layers" in cfg:
         engine_kwargs["max_layers"] = cfg["max_layers"]
+    if cfg.get("dtype"):
+        import torch
+        engine_kwargs["dtype"] = getattr(torch, cfg["dtype"])
     engine = LlamaEngine(**engine_kwargs)
 
     # Warmup -- 16-token prompt, matching the LLM workers. ignore_eos so the 16
@@ -1809,6 +1863,12 @@ def main():
             )
             engine.block_manager.reset()
             torch.cuda.synchronize()
+            for _warmup_index in range(cfg.get("warmup_iters", 1)):
+                _warmup_outputs = engine.generate(prompts, sp_list, use_tqdm=False)
+                torch.cuda.synchronize()
+                del _warmup_outputs
+            if hasattr(engine, "block_manager"):
+                engine.block_manager.reset()
             start = time.perf_counter()
             outputs = engine.generate(prompts, sp_list, use_tqdm=True)
             torch.cuda.synchronize()
@@ -1871,6 +1931,16 @@ def main():
             )
             engine.block_manager.reset()
             torch.cuda.synchronize()
+            for _warmup_index in range(cfg.get("warmup_iters", 1)):
+                _warmup_outputs = engine.generate(prompts, sp_list,
+                                          images=batch_images,
+                                          videos=batch_videos,
+                                          audio_features=batch_audios,
+                                          use_tqdm=False)
+                torch.cuda.synchronize()
+                del _warmup_outputs
+            if hasattr(engine, "block_manager"):
+                engine.block_manager.reset()
             start = time.perf_counter()
             outputs = engine.generate(prompts, sp_list,
                                       images=batch_images,
@@ -1885,6 +1955,7 @@ def main():
         result = {
             "name": scenario["name"],
             "elapsed": elapsed,
+            "warmup_iters": cfg.get("warmup_iters", 1),
             "total_input_tokens": total_input_tokens if modality == "text" else 0,
             "total_output_tokens": total_output_tokens,
             "outputs": [
@@ -2039,7 +2110,7 @@ def _configure_parallel_safe_flashinfer():
         from flashinfer.comm import mnnvl
     except Exception:
         return
-    if getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
+    if not hasattr(mnnvl, "IpcSocket") or getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
         return
 
     original_init = mnnvl.IpcSocket.__init__
@@ -2058,6 +2129,9 @@ def _configure_parallel_safe_flashinfer():
 
 _configure_parallel_safe_flashinfer()
 
+from fastkernels.validate.media_inputs import frozen_media
+
+@frozen_media
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
     from datasets import Audio, load_dataset
@@ -2113,6 +2187,8 @@ def main():
     if cfg["tp"] > 1:
         # See the LLM worker: keep multi-GPU off vLLM's ray executor.
         llm_kwargs["distributed_executor_backend"] = "mp"
+    if cfg.get("dtype"):
+        llm_kwargs["dtype"] = cfg["dtype"]
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("kv_cache_dtype"):
@@ -2178,6 +2254,9 @@ def main():
             SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=1),
             use_tqdm=False,
         )
+        for _warmup_index in range(cfg.get("warmup_iters", 1)):
+            _warmup_outputs = llm.generate(prompts, sp, use_tqdm=False)
+            del _warmup_outputs
         start = time.perf_counter()
         outputs = llm.generate(prompts, sp, use_tqdm=True)
         elapsed = time.perf_counter() - start
@@ -2189,6 +2268,7 @@ def main():
         result = {
             "name": scenario["name"],
             "elapsed": elapsed,
+            "warmup_iters": cfg.get("warmup_iters", 1),
             "total_output_tokens": total_output_tokens,
             "num_seqs": len(audio_samples),
             "total_audio_duration_s": total_audio_s,
@@ -2289,6 +2369,9 @@ def _decode_audio_array(audio):
         samples = samples.mean(axis=0)
     return samples, int(sampling_rate)
 
+from fastkernels.validate.media_inputs import frozen_media
+
+@frozen_media
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
     from datasets import Audio, load_dataset
@@ -2340,6 +2423,9 @@ def main():
         engine_kwargs["max_model_len"] = cfg["max_model_len"]
     if "max_layers" in cfg:
         engine_kwargs["max_layers"] = cfg["max_layers"]
+    if cfg.get("dtype"):
+        import torch
+        engine_kwargs["dtype"] = getattr(torch, cfg["dtype"])
     engine = LlamaEngine(**engine_kwargs)
 
     import torch
@@ -2386,6 +2472,15 @@ def main():
 
         engine.block_manager.reset()
         torch.cuda.synchronize()
+        for _warmup_index in range(cfg.get("warmup_iters", 1)):
+            _warmup_outputs = engine.generate(
+                decoder_prompts, sp,
+                audio_features=audio_features_list, use_tqdm=False,
+            )
+            torch.cuda.synchronize()
+            del _warmup_outputs
+        if hasattr(engine, "block_manager"):
+            engine.block_manager.reset()
         start = time.perf_counter()
         outputs = engine.generate(
             decoder_prompts, sp,
@@ -2398,6 +2493,7 @@ def main():
         result = {
             "name": scenario["name"],
             "elapsed": elapsed,
+            "warmup_iters": cfg.get("warmup_iters", 1),
             "total_output_tokens": total_output_tokens,
             "num_seqs": len(audio_samples),
             "total_audio_duration_s": total_audio_s,
@@ -2539,6 +2635,27 @@ def compute_alignment(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def _prepare_frozen_media(throughput, latency, seed, whisper=False):
+    if not os.environ.get("FASTKERNELS_MEDIA_CACHE"):
+        return
+    from fastkernels.validate.media_inputs import frozen_media, preload_media
+    scope = {"np": np, "frozen_media": frozen_media}
+    if whisper:
+        import ast
+        # Compile only the two data-loader definitions, without worker/engine setup.
+        nodes = [n for n in ast.parse(VLLM_WHISPER_WORKER).body
+                 if isinstance(n, ast.FunctionDef)
+                 and n.name in ("_decode_audio_array", "_load_librispeech")]
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<media-preparation>", "exec"), scope)
+        loader = scope["_load_librispeech"]
+    else:
+        exec(_MM_PRELOAD_FN, scope)
+        loader = scope["_preload_mm_data"]
+    print("Preparing frozen media before engine initialization", flush=True)
+    preload_media(throughput, latency, seed, loader, whisper)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Throughput & alignment benchmark: fastkernels baseline vs vLLM",
@@ -2547,6 +2664,7 @@ def main():
         "--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
     )
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--num-seqs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -2598,6 +2716,9 @@ def main():
                         help="Skip the throughput phase (run latency only)")
     parser.add_argument("--skip-latency", action="store_true",
                         help="Skip the latency benchmark phase")
+    parser.add_argument("--workloads", help="Comma-separated exact workload names from the scenario table")
+    parser.add_argument("--warmup-iters", type=int, default=1, help="Full untimed throughput replays per engine and workload")
+    parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--latency-iters", type=int, default=5,
                         help="Timed iterations per latency scenario (default: 5)")
     parser.add_argument(
@@ -2621,11 +2742,21 @@ def main():
         help="Run only the throughput scenario with this name (e.g. "
              "'mixed'). Default: run all scenarios for the model type.",
     )
+    frozen_group = parser.add_mutually_exclusive_group()
+    frozen_group.add_argument("--inputs-json", help="Replay frozen text validation inputs")
+    frozen_group.add_argument("--save-inputs-json", help="Save exact text validation inputs before running")
+    parser.add_argument("--reference-patches", choices=["auto", "off"], default="auto",
+                        help="Apply existing validation reference workarounds, or run without them")
     args = parser.parse_args()
+    if args.warmup_iters < 1 or args.latency_iters < 1:
+        parser.error("Warmup and latency iteration counts must be positive")
+    if args.max_num_seqs is not None and args.max_num_seqs < 1:
+        parser.error("--max-num-seqs must be positive")
     args.trust_remote_code = (
         args.trust_remote_code or _needs_trust_remote_code(args.model)
     )
 
+    explicit_request_cap = args.num_seqs is not None
     if args.num_seqs is None:
         args.num_seqs = 100 if _is_whisper_model(args.model) else 1000
 
@@ -2638,18 +2769,16 @@ def main():
         print("  NOTE: JambaEngine is single-process; using --tp 1.")
         args.tp = 1
     engine_env = _apply_per_model_defaults(args.model, args)
-    hopper_mamba_max_num_seqs = (
-        _HOPPER_MAMBA_MAX_NUM_SEQS
+    mamba_max_num_seqs = (
+        _default_mamba_max_num_seqs(args.model, _cuda_cc_major())
         if (
             not is_vlm
             and not is_qwen_omni
             and not is_whisper
-            and _is_pure_mamba_model(args.model)
-            and _cuda_cc_major() == 9
         )
         else None
     )
-    engine_max_num_seqs = hopper_mamba_max_num_seqs
+    engine_max_num_seqs = args.max_num_seqs or mamba_max_num_seqs
     if engine_max_num_seqs is None and is_jamba:
         engine_max_num_seqs = _JAMBA_MAX_NUM_SEQS
 
@@ -2704,7 +2833,8 @@ def main():
         # whose page size already yields alignment == 1, and it never changes a
         # measured config -- so it does not need to be model-gated.
         os.environ["FASTKERNELS_ALIGN_PROFILING_KV_BLOCKS"] = "1"
-        _install_bench_sitecustomize()
+        if args.reference_patches == "auto":
+            _install_bench_sitecustomize()
 
     if is_whisper:
         throughput_scenarios = WHISPER_SCENARIOS
@@ -2739,169 +2869,200 @@ def main():
                 f"scenario for this model type."
             )
 
-    # Pre-generate all scenario data
-    scenario_data = []
-    global_max_seq_len = 0
-    tokenizer = None
-    if not is_whisper:
-        tokenizer = _load_tokenizer(args.model)
-    # vLLM (>=0.24.0) rejects a max_model_len exceeding the model's derived
-    # context window, and real long-context prompts can land a few tokens over
-    # (e.g. LongBench rows whose prompt+decode slightly exceeds 128K). Trim the
-    # tail of the raw prompt content of such rows (re-applying the chat template
-    # so no special tokens are dropped) to keep every request valid.
-    model_max_ctx = None if is_whisper else _get_model_max_context_len(args.model)
+    if args.workloads:
+        requested = args.workloads.split(',')
+        known = {s['name'] for s in throughput_scenarios + latency_scenarios}
+        if len(requested) != len(set(requested)) or set(requested) - known:
+            parser.error('Unknown or duplicate workloads: ' + args.workloads)
+        throughput_scenarios = [s for s in throughput_scenarios if s['name'] in requested]
+        latency_scenarios = [s for s in latency_scenarios if s['name'] in requested]
+        args.skip_throughput = args.skip_throughput or not throughput_scenarios
+        args.skip_latency = args.skip_latency or not latency_scenarios
 
-    def _fit_prompts_to_ctx(samples):
-        """Prompt token ids for ``samples``, trimming the tail of the raw
-        prompt *content* (never the chat template / special tokens) so each
-        prompt plus its decode budget fits the model context window."""
-        prompt_token_ids = []
-        n_trunc = 0
-        for s in samples:
-            ids = list(s.prompt_token_ids)
-            if model_max_ctx is not None and s.messages is not None:
-                budget = model_max_ctx - s.output_len
-                if budget >= 1 and len(ids) > budget:
-                    ids = _fit_messages_to_context(
-                        tokenizer, s.messages, budget)
-                    n_trunc += 1
-            prompt_token_ids.append(ids)
-        if n_trunc:
-            print(f"  NOTE: trimmed prompt content of {n_trunc} request(s) to "
-                  f"fit {model_max_ctx}-token model context "
-                  f"(chat template preserved)")
-        return prompt_token_ids
+    # Frozen inputs are owned by this canonical validation protocol. Both
+    # reference versions replay the same token IDs and generation budgets.
+    frozen_module = import_module(f"{_PACKAGE_NAME}.validate.frozen_inputs")
+    load_inputs, save_inputs, digest = frozen_module.load_inputs, frozen_module.save_inputs, frozen_module.digest
+    input_identity = {
+        "model": args.model, "scenario": args.scenario, "num_seqs": args.num_seqs,
+        "seed": args.seed, "skip_throughput": args.skip_throughput,
+        "skip_latency": args.skip_latency, "latency_iters": args.latency_iters,
+        "workloads": args.workloads, "warmup_iters": args.warmup_iters, "dtype": args.dtype,
+    }
+    if (args.inputs_json or args.save_inputs_json) and (is_vlm or is_qwen_omni or is_whisper) and not os.environ.get("FASTKERNELS_MEDIA_CACHE"):
+        raise SystemExit("Multimodal replay requires a private FASTKERNELS_MEDIA_CACHE")
+    if args.inputs_json:
+        frozen = load_inputs(Path(args.inputs_json), input_identity)
+        scenario_data = frozen["throughput"]
+        latency_data = frozen["latency"]
+        global_max_seq_len = frozen["max_model_len"]
+        model_max_ctx = None if is_whisper else _get_model_max_context_len(args.model)
+    else:
+        # Pre-generate all scenario data
+        scenario_data = []
+        global_max_seq_len = 0
+        tokenizer = None
+        if not is_whisper:
+            tokenizer = _load_tokenizer(args.model)
+        # vLLM (>=0.24.0) rejects a max_model_len exceeding the model's derived
+        # context window, and real long-context prompts can land a few tokens over
+        # (e.g. LongBench rows whose prompt+decode slightly exceeds 128K). Trim the
+        # tail of the raw prompt content of such rows (re-applying the chat template
+        # so no special tokens are dropped) to keep every request valid.
+        model_max_ctx = None if is_whisper else _get_model_max_context_len(args.model)
 
-    if not args.skip_throughput:
-        for i, scenario in enumerate(throughput_scenarios):
-            if is_whisper:
-                output_len = scenario["output_len"]
-                max_seq_len = output_len + 10  # decoder prompt + output
-                if max_seq_len > global_max_seq_len:
-                    global_max_seq_len = max_seq_len
-                num_seqs = args.num_seqs
-                if scenario.get("use_full_dataset"):
-                    num_seqs = 999_999  # load all available samples
-                scenario_data.append({
-                    "name": scenario["name"],
-                    "output_len": output_len,
-                    "dataset": scenario["dataset"],
-                    "dataset_split": scenario["dataset_split"],
-                    "num_seqs": num_seqs,
-                })
-                continue
+        def _fit_prompts_to_ctx(samples):
+            """Prompt token ids for ``samples``, trimming the tail of the raw
+            prompt *content* (never the chat template / special tokens) so each
+            prompt plus its decode budget fits the model context window."""
+            prompt_token_ids = []
+            n_trunc = 0
+            for s in samples:
+                ids = list(s.prompt_token_ids)
+                if model_max_ctx is not None and s.messages is not None:
+                    budget = model_max_ctx - s.output_len
+                    if budget >= 1 and len(ids) > budget:
+                        ids = _fit_messages_to_context(
+                            tokenizer, s.messages, budget)
+                        n_trunc += 1
+                prompt_token_ids.append(ids)
+            if n_trunc:
+                print(f"  NOTE: trimmed prompt content of {n_trunc} request(s) to "
+                      f"fit {model_max_ctx}-token model context "
+                      f"(chat template preserved)")
+            return prompt_token_ids
 
-            modality = scenario.get("modality", "text") if (is_vlm or is_qwen_omni) else "text"
-            if modality == "text":
-                if scenario.get("dataset") is not None:
+        if not args.skip_throughput:
+            for i, scenario in enumerate(throughput_scenarios):
+                if is_whisper:
+                    # Four decoder prompt tokens share Whisper's 448-token window.
+                    # Freeze the effective budget instead of relying on silent clipping.
+                    output_len = min(scenario["output_len"], 448 - 4)
+                    max_seq_len = output_len + 10  # decoder prompt + output
+                    if max_seq_len > global_max_seq_len:
+                        global_max_seq_len = max_seq_len
+                    num_seqs = args.num_seqs
+                    if scenario.get("use_full_dataset") and not explicit_request_cap:
+                        num_seqs = 999_999  # load all available samples
+                    scenario_data.append({
+                        "name": scenario["name"],
+                        "output_len": output_len,
+                        "dataset": scenario["dataset"],
+                        "dataset_split": scenario["dataset_split"],
+                        "num_seqs": num_seqs,
+                    })
+                    continue
+
+                modality = scenario.get("modality", "text") if (is_vlm or is_qwen_omni) else "text"
+                if modality == "text":
+                    if scenario.get("dataset") is not None:
+                        samples = load_real_prompt_workload(
+                            scenario["name"],
+                            tokenizer,
+                            num_requests=args.num_seqs,
+                            decode_cap=None,
+                            dataset_name=scenario["dataset"],
+                            seed=args.seed + i,
+                        )
+                        prompt_token_ids = _fit_prompts_to_ctx(samples)
+                        output_lens = [s.output_len for s in samples]
+                    else:
+                        raise ValueError(
+                            f"text throughput scenario '{scenario['name']}' has no "
+                            "dataset; all text workloads must use a real prompt "
+                            "dataset (synthetic random-token prompts are not allowed)"
+                        )
+                    max_seq_len = max(
+                        len(p) + ol
+                        for p, ol in zip(prompt_token_ids, output_lens)
+                    )
+                    if max_seq_len > global_max_seq_len:
+                        global_max_seq_len = max_seq_len
+                    scenario_data.append({
+                        "name": scenario["name"],
+                        "modality": "text",
+                        "prompt_token_ids": prompt_token_ids,
+                        "output_lens": output_lens,
+                    })
+                else:
+                    # Multimodal datasets are loaded inside the subprocess worker.
+                    # Large media inputs can produce many tokens; be generous.
+                    max_seq_len = 16384 + scenario["output_len"]
+                    if max_seq_len > global_max_seq_len:
+                        global_max_seq_len = max_seq_len
+                    scenario_data.append({
+                        "name": scenario["name"],
+                        "modality": modality,
+                        "output_len": scenario["output_len"],
+                        "dataset": scenario["dataset"],
+                        "dataset_split": scenario["dataset_split"],
+                        "num_seqs": args.num_seqs,
+                    })
+
+        # Pre-generate latency scenario data
+        latency_data = []
+        if not args.skip_latency:
+            for j, ls in enumerate(latency_scenarios):
+                if is_whisper:
+                    max_seq_len = ls["output_len"] + 10
+                    if max_seq_len > global_max_seq_len:
+                        global_max_seq_len = max_seq_len
+                    latency_data.append({
+                        "name": ls["name"],
+                        "output_len": min(ls["output_len"], 448 - 4),
+                        "batch_size": ls["batch_size"],
+                        "dataset": ls["dataset"],
+                        "dataset_split": ls["dataset_split"],
+                        "num_warmup": 3,
+                        "num_iters": args.latency_iters,
+                    })
+                    continue
+
+                modality = ls.get("modality", "text") if (is_vlm or is_qwen_omni) else "text"
+                if modality == "text":
+                    bs = ls["batch_size"]
                     samples = load_real_prompt_workload(
-                        scenario["name"],
+                        "mixed",
                         tokenizer,
-                        num_requests=args.num_seqs,
-                        decode_cap=None,
-                        dataset_name=scenario["dataset"],
-                        seed=args.seed + i,
+                        num_requests=bs,
+                        decode_cap=ls["output_len"],
+                        dataset_name=ls.get("dataset") or None,
+                        seed=args.seed + 100 + j,
                     )
                     prompt_token_ids = _fit_prompts_to_ctx(samples)
                     output_lens = [s.output_len for s in samples]
-                else:
-                    raise ValueError(
-                        f"text throughput scenario '{scenario['name']}' has no "
-                        "dataset; all text workloads must use a real prompt "
-                        "dataset (synthetic random-token prompts are not allowed)"
+                    real_input_len = max((len(p) for p in prompt_token_ids), default=0)
+                    seq_len = max(
+                        len(p) + ol
+                        for p, ol in zip(prompt_token_ids, output_lens)
                     )
-                max_seq_len = max(
-                    len(p) + ol
-                    for p, ol in zip(prompt_token_ids, output_lens)
-                )
-                if max_seq_len > global_max_seq_len:
-                    global_max_seq_len = max_seq_len
-                scenario_data.append({
-                    "name": scenario["name"],
-                    "modality": "text",
-                    "prompt_token_ids": prompt_token_ids,
-                    "output_lens": output_lens,
-                })
-            else:
-                # Multimodal datasets are loaded inside the subprocess worker.
-                # Large media inputs can produce many tokens; be generous.
-                max_seq_len = 16384 + scenario["output_len"]
-                if max_seq_len > global_max_seq_len:
-                    global_max_seq_len = max_seq_len
-                scenario_data.append({
-                    "name": scenario["name"],
-                    "modality": modality,
-                    "output_len": scenario["output_len"],
-                    "dataset": scenario["dataset"],
-                    "dataset_split": scenario["dataset_split"],
-                    "num_seqs": args.num_seqs,
-                })
-
-    # Pre-generate latency scenario data
-    latency_data = []
-    if not args.skip_latency:
-        for j, ls in enumerate(latency_scenarios):
-            if is_whisper:
-                max_seq_len = ls["output_len"] + 10
-                if max_seq_len > global_max_seq_len:
-                    global_max_seq_len = max_seq_len
-                latency_data.append({
-                    "name": ls["name"],
-                    "output_len": ls["output_len"],
-                    "batch_size": ls["batch_size"],
-                    "dataset": ls["dataset"],
-                    "dataset_split": ls["dataset_split"],
-                    "num_warmup": 3,
-                    "num_iters": args.latency_iters,
-                })
-                continue
-
-            modality = ls.get("modality", "text") if (is_vlm or is_qwen_omni) else "text"
-            if modality == "text":
-                bs = ls["batch_size"]
-                samples = load_real_prompt_workload(
-                    "mixed",
-                    tokenizer,
-                    num_requests=bs,
-                    decode_cap=ls["output_len"],
-                    dataset_name=ls.get("dataset") or None,
-                    seed=args.seed + 100 + j,
-                )
-                prompt_token_ids = _fit_prompts_to_ctx(samples)
-                output_lens = [s.output_len for s in samples]
-                real_input_len = max((len(p) for p in prompt_token_ids), default=0)
-                seq_len = max(
-                    len(p) + ol
-                    for p, ol in zip(prompt_token_ids, output_lens)
-                )
-                if seq_len > global_max_seq_len:
-                    global_max_seq_len = seq_len
-                latency_data.append({
-                    "name": ls["name"],
-                    "modality": "text",
-                    "input_len": real_input_len,
-                    "output_len": ls["output_len"],
-                    "batch_size": bs,
-                    "prompt_token_ids": prompt_token_ids,
-                    "output_lens": output_lens,
-                    "num_warmup": 3,
-                    "num_iters": args.latency_iters,
-                })
-            else:
-                max_seq_len = 16384 + ls["output_len"]
-                if max_seq_len > global_max_seq_len:
-                    global_max_seq_len = max_seq_len
-                latency_data.append({
-                    "name": ls["name"],
-                    "modality": modality,
-                    "output_len": ls["output_len"],
-                    "batch_size": ls["batch_size"],
-                    "dataset": ls["dataset"],
-                    "dataset_split": ls["dataset_split"],
-                    "num_warmup": 3,
-                    "num_iters": args.latency_iters,
-                })
+                    if seq_len > global_max_seq_len:
+                        global_max_seq_len = seq_len
+                    latency_data.append({
+                        "name": ls["name"],
+                        "modality": "text",
+                        "input_len": real_input_len,
+                        "output_len": ls["output_len"],
+                        "batch_size": bs,
+                        "prompt_token_ids": prompt_token_ids,
+                        "output_lens": output_lens,
+                        "num_warmup": 3,
+                        "num_iters": args.latency_iters,
+                    })
+                else:
+                    max_seq_len = 16384 + ls["output_len"]
+                    if max_seq_len > global_max_seq_len:
+                        global_max_seq_len = max_seq_len
+                    latency_data.append({
+                        "name": ls["name"],
+                        "modality": modality,
+                        "output_len": ls["output_len"],
+                        "batch_size": ls["batch_size"],
+                        "dataset": ls["dataset"],
+                        "dataset_split": ls["dataset_split"],
+                        "num_warmup": 3,
+                        "num_iters": args.latency_iters,
+                    })
 
     # Safety net: if any scenario path still produced a length beyond the
     # model's context window (e.g. the multimodal token estimate), cap it so
@@ -2912,6 +3073,13 @@ def main():
             f"{model_max_ctx} (model context limit)"
         )
         global_max_seq_len = model_max_ctx
+
+    input_payload = {"schema": 1, "identity": input_identity,
+                     "throughput": scenario_data, "latency": latency_data,
+                     "max_model_len": global_max_seq_len}
+    if args.save_inputs_json:
+        save_inputs(Path(args.save_inputs_json), input_payload)
+    input_sha256 = digest(input_payload)
 
     print("=" * 70)
     print("  fastkernels Baseline vs vLLM -- Multi-Scenario Benchmark")
@@ -2936,11 +3104,14 @@ def main():
     print(f"  Trust RC       : {args.trust_remote_code}")
     print(f"  Max seq len    : {global_max_seq_len}")
     if engine_max_num_seqs is not None:
-        reason = (
-            "Hopper Mamba; vLLM CUDA-graph cap"
-            if hopper_mamba_max_num_seqs is not None
-            else "JambaEngine default"
-        )
+        if args.max_num_seqs is not None:
+            reason = "explicit limit, both engines"
+        elif "mamba-codestral" in args.model.lower():
+            reason = "Codestral state-memory limit, both engines"
+        elif mamba_max_num_seqs is not None:
+            reason = "Hopper Mamba; vLLM CUDA-graph cap"
+        else:
+            reason = "JambaEngine default"
         print(f"  max_num_seqs   : {engine_max_num_seqs} ({reason})")
     if engine_env:
         print(
@@ -2961,6 +3132,9 @@ def main():
         print(f"  Latency        : {', '.join(s['name'] for s in latency_scenarios)}"
               f" ({args.latency_iters} iters)")
     print("=" * 70)
+
+    if is_whisper or is_vlm or is_qwen_omni:
+        _prepare_frozen_media(scenario_data, latency_data, args.seed, is_whisper)
 
     if is_whisper:
         vllm_worker = VLLM_WHISPER_WORKER
@@ -2986,6 +3160,8 @@ def main():
         max_num_seqs=engine_max_num_seqs,
         engine_env=engine_env,
         scenarios=scenario_data, latency=latency_data,
+        reference_patches=args.reference_patches, vllm_python=args.vllm_python,
+        warmup_iters=args.warmup_iters, dtype=args.dtype,
     )
     vllm_raw_path = (os.path.join(args.output_dir, "vllm_raw.json")
                      if args.output_dir else None)
@@ -3020,6 +3196,7 @@ def main():
                     else {}
                 ),
                 "scenarios": scenario_data,
+                "warmup_iters": args.warmup_iters, "dtype": args.dtype,
                 "latency_scenarios": latency_data,
                 "trust_remote_code": args.trust_remote_code,
                 "load_format": "fastsafetensors",
@@ -3096,6 +3273,7 @@ def main():
             "project_root": kb_root,
             "package_name": package_name,
             "scenarios": scenario_data,
+                "warmup_iters": args.warmup_iters, "dtype": args.dtype,
             "latency_scenarios": latency_data,
         }
         if args.max_layers is not None:
@@ -3332,6 +3510,15 @@ def main():
         results_path = os.path.join(args.output_dir, "results.json")
         combined = {
             "gpu": gpu,
+            "input_sha256": input_sha256,
+            "reference_patches": args.reference_patches,
+            "engine_env": engine_env,
+            "max_model_len": global_max_seq_len,
+            "max_num_seqs": engine_max_num_seqs,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "kv_cache_dtype": args.kv_cache_dtype,
+            "warmup_iters": args.warmup_iters, "dtype": args.dtype,
+            "media_inputs": __import__("fastkernels.validate.media_inputs", fromlist=["media_manifest"]).media_manifest(),
             "model": args.model,
             "model_type": (
                 "qwen_omni" if is_qwen_omni

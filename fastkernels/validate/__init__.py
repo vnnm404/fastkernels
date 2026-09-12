@@ -108,6 +108,13 @@ def _harness_for(hf_name: str, draft_model: str | None = None) -> str | None:
     # transformers config download during planning/dry-run when that local
     # registry match is sufficient.
     module = _module_from_name(hf_name) or module_for(hf_name)
+    if module is None:
+        # Dense Qwen2/Qwen2.5 is supported by bench_vllm's LlamaEngine but
+        # has no separate entry in the architecture registry. Use config,
+        # not a substring that could also select VL or hybrid variants.
+        from fastkernels.workloads import _model_type_from_config_json
+        if _model_type_from_config_json(hf_name) == "qwen2":
+            return "bench_vllm"
     return _MODULE_TO_HARNESS.get(module) if module else None
 
 
@@ -321,6 +328,26 @@ def _build_cmd(
             cmd += ["--cache-dir", str(output_dir / "cache")]
     if harness == "bench_vllm" and getattr(args, "vllm_python", None):
         cmd += ["--vllm-python", args.vllm_python]
+    if harness == "bench_vllm":
+        if scenario.dtype in ("bfloat16", "float16", "float32"):
+            cmd += ["--dtype", scenario.dtype]
+        if not getattr(args, "text_scenario", None):
+            cmd += ["--workloads", ",".join(_scenario_workloads(scenario))]
+        if getattr(scenario, "max_num_seqs", None):
+            cmd += ["--max-num-seqs", str(scenario.max_num_seqs)]
+        for name, flag in (
+            ("warmup_iters", "--warmup-iters"),
+            ("text_scenario", "--scenario"), ("seed", "--seed"),
+            ("latency_iters", "--latency-iters"),
+            ("reference_patches", "--reference-patches"),
+            ("inputs_json", "--inputs-json"),
+            ("save_inputs_json", "--save-inputs-json"),
+        ):
+            value = getattr(args, name, None)
+            if value is not None:
+                cmd += [flag, str(value)]
+        if getattr(args, "skip_latency", False):
+            cmd.append("--skip-latency")
     cmd += _output_args(harness, output_dir)
     if harness == "bench_vllm" and getattr(args, "resume", False):
         cmd.append("--resume")
@@ -493,11 +520,36 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional interpreter for bench_vllm's reference worker.",
     )
     parser.add_argument("--dry-run", action="store_true")
+    # A single text job may freeze/replay its exact workload for drift audits.
+    # Keep dispatch, resource allocation, environment, and coverage checks intact.
+    parser.add_argument("--text-scenario", choices=("mixed", "long-context"))
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--warmup-iters", type=int, default=None)
+    parser.add_argument("--latency-iters", type=int, default=None)
+    parser.add_argument("--reference-patches", choices=("auto", "off"))
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--inputs-json")
+    inputs.add_argument("--save-inputs-json")
+    parser.add_argument("--skip-latency", action="store_true")
     args = parser.parse_args(argv)
 
     try:
         scenarios = _resolve_validate_scenarios(args.scenarios)
         run_id, run_root = _resolve_run_root(args)
+        text_options = any(getattr(args, k) is not None for k in (
+            "text_scenario", "seed", "latency_iters", "warmup_iters", "reference_patches",
+            "inputs_json", "save_inputs_json",
+        )) or args.skip_latency
+        if text_options and (len(scenarios) != 1 or
+                _harness_for(scenarios[0].hf_name) != "bench_vllm"):
+            raise ValueError("Replay and timing options require exactly one bench_vllm scenario")
+        if args.warmup_iters is not None and args.warmup_iters < 1:
+            raise ValueError("--warmup-iters must be positive")
+        if args.latency_iters is not None and args.latency_iters < 1:
+            raise ValueError("--latency-iters must be positive")
+        for name in ("inputs_json", "save_inputs_json"):
+            if getattr(args, name):
+                setattr(args, name, str(Path(getattr(args, name)).expanduser().resolve()))
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

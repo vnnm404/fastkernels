@@ -80,3 +80,5 @@ failed media and measurement evidence are retained. Run on one local node;
 attaching to an existing remote Ray cluster is not supported for drift.
 
 </details>
+
+[H100 diagnostic results: vLLM 0.18.0 vs 0.26.0](results/drift-h100-2026-09-13.md).

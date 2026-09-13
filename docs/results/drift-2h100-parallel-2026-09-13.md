@@ -71,7 +71,7 @@ Partial completed pairs may appear for failed models; check coverage below.
 
 ## Saved evidence and cost
 
-Raw evidence is retained locally outside the repository in `drift-audit/experiments/2026-09-13-parallel-2h100/`: `gpu-monitor.jsonl`, `parallelism-evidence.json`, `parallel-results/`, the scenario YAML, commands, provisioning log and billing records. All six completed phase artifact checksums were verified. No model weights were copied back.
+Raw evidence is retained locally outside the repository in `drift-results/audit/experiments/2026-09-13-parallel-2h100/`: `gpu-monitor.jsonl`, `parallelism-evidence.json`, `parallel-results/`, the scenario YAML, commands, provisioning log and billing records. All six completed phase artifact checksums were verified. No model weights were copied back.
 
 Reported cost: **$3.01**, including the first inaccessible rental and transfers (billing may settle later).
 Both rented instances were destroyed and their absence verified.

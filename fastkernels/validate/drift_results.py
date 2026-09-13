@@ -283,12 +283,22 @@ def write_summary(root, scenarios, statuses):
 
     config = json.loads((root / "drift.json").read_text())
     excluded = config["exclude_fastkernels"]
+    request_cap = config.get("max_requests")
+    workload_size = (
+        f"diagnostic cap of {request_cap} throughput requests per workload"
+        if request_cap is not None
+        else "canonical workload sizes"
+    )
     lines = [
         "# vLLM version drift",
         "",
         f"vLLM {config['baseline']} → {config['candidate']}; FastKernels {'excluded' if excluded else 'included'}.",
         "",
-        "Models run concurrently on disjoint GPUs. Each old/new pair uses the same GPUs,",
+        f"Settings: {workload_size}; {config.get('repeats', 3)} paired repeat(s); "
+        f"{config.get('warmup_iters', 1)} full throughput warmup(s); "
+        f"3 latency warmups + {config.get('latency_iters', 5)} measured iterations.",
+        "",
+        "Ray schedules models on disjoint GPUs when capacity permits. Each old/new pair uses the same GPUs,",
         "frozen inputs, and full throughput warmup. CPU, storage, and host bandwidth are shared.",
         "These compare release environments, including their dependency differences.",
         "",

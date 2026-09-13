@@ -329,6 +329,8 @@ def _build_cmd(
     if harness == "bench_vllm" and getattr(args, "vllm_python", None):
         cmd += ["--vllm-python", args.vllm_python]
     if harness == "bench_vllm":
+        if getattr(args, "exclude_fastkernels", False):
+            cmd.append("--exclude-fastkernels")
         if scenario.dtype in ("bfloat16", "float16", "float32"):
             cmd += ["--dtype", scenario.dtype]
         if not getattr(args, "text_scenario", None):
@@ -477,16 +479,29 @@ def _resolve_run_root(args) -> tuple[str, Path]:
     return run_id, _VALIDATE_ROOT / run_id
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parser(drift: bool = False):
     parser = argparse.ArgumentParser(
-        prog="fastkernels validate",
+        prog="fastkernels validate drift" if drift else "fastkernels validate",
         description="Run each validation scenario as a named, GPU-aware Ray task.",
+        epilog="Release comparison: fastkernels validate drift OLD NEW --help" if not drift else None,
     )
-    parser.add_argument(
-        "scenarios",
-        help="Scenario path or packaged name. Both workloads and "
-        "legacy_workloads tables are supported.",
-    )
+    if drift:
+        parser.add_argument("baseline")
+        parser.add_argument("candidate")
+        parser.add_argument("--scenarios", default="full")
+        parser.add_argument("--exclude-fastkernels", action="store_true",
+                            help="Measure only vLLM; FastKernels is included by default")
+        parser.add_argument("--baseline-python")
+        parser.add_argument("--candidate-python")
+        parser.add_argument("--env-root", type=Path)
+        parser.add_argument("--data-root", type=Path)
+        parser.add_argument("--repeats", type=int, default=3)
+        parser.add_argument("--retries", type=int, default=1)
+        parser.add_argument("--alignment-floor", type=float, default=32)
+        parser.add_argument("--min-free-gb", type=float, default=10)
+        parser.add_argument("--keep-models", action="store_true")
+    else:
+        parser.add_argument("scenarios", help="Scenario path or packaged name")
     parser.add_argument("--max-requests", type=int, default=None)
     parser.add_argument("--max-layers", type=int, default=None)
     parser.add_argument("--gpus", default=None)
@@ -509,28 +524,44 @@ def main(argv: list[str] | None = None) -> int:
              "concurrent jobs onto the same node, so they contend for its "
              "cores and memory bandwidth.",
     )
-    parser.add_argument(
-        "--ray-address",
-        default=None,
-        help="Existing Ray cluster address. Default starts a local Ray runtime.",
-    )
-    parser.add_argument(
-        "--vllm-python",
-        default=None,
-        help="Optional interpreter for bench_vllm's reference worker.",
-    )
+    if not drift:
+        parser.add_argument(
+            "--ray-address",
+            default=None,
+            help="Existing Ray cluster address. Default starts a local Ray runtime.",
+        )
+        parser.add_argument(
+            "--vllm-python",
+            default=None,
+            help="Optional interpreter for bench_vllm's reference worker.",
+        )
     parser.add_argument("--dry-run", action="store_true")
     # A single text job may freeze/replay its exact workload for drift audits.
     # Keep dispatch, resource allocation, environment, and coverage checks intact.
-    parser.add_argument("--text-scenario", choices=("mixed", "long-context"))
+    if not drift:
+        parser.add_argument("--text-scenario", choices=("mixed", "long-context"))
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--warmup-iters", type=int, default=None)
     parser.add_argument("--latency-iters", type=int, default=None)
     parser.add_argument("--reference-patches", choices=("auto", "off"))
-    inputs = parser.add_mutually_exclusive_group()
-    inputs.add_argument("--inputs-json")
-    inputs.add_argument("--save-inputs-json")
-    parser.add_argument("--skip-latency", action="store_true")
+    if not drift:
+        inputs = parser.add_mutually_exclusive_group()
+        inputs.add_argument("--inputs-json")
+        inputs.add_argument("--save-inputs-json")
+        parser.add_argument("--skip-latency", action="store_true")
+    if drift:
+        parser.set_defaults(seed=42, warmup_iters=1, latency_iters=5,
+                            reference_patches="auto", drift=True, ray_address=None, vllm_python=None,
+                            text_scenario=None, inputs_json=None, save_inputs_json=None, skip_latency=False)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "drift":
+        from .drift import main as drift_main
+        return drift_main(argv[1:])
+    parser = _parser()
     args = parser.parse_args(argv)
 
     try:

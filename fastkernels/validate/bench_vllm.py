@@ -1015,6 +1015,7 @@ def main():
             "output_len": ls["output_len"],
             "num_iters": num_iters,
             "latencies": latencies,
+            "num_warmup": num_warmup,
         })
 
     del llm
@@ -1198,6 +1199,7 @@ def main():
             "output_len": ls["output_len"],
             "num_iters": num_iters,
             "latencies": latencies,
+            "num_warmup": num_warmup,
         })
 
     with open(cfg["output_file"], "w") as f:
@@ -1778,6 +1780,7 @@ def main():
             "output_len": ls["output_len"],
             "num_iters": num_iters,
             "latencies": latencies,
+            "num_warmup": num_warmup,
         })
 
     del llm
@@ -2034,6 +2037,7 @@ def main():
             "output_len": ls["output_len"],
             "num_iters": num_iters,
             "latencies": latencies,
+            "num_warmup": num_warmup,
         })
 
     with open(cfg["output_file"], "w") as f:
@@ -2318,6 +2322,7 @@ def main():
             "output_len": output_len,
             "num_iters": num_iters,
             "latencies": latencies,
+            "num_warmup": num_warmup,
         })
 
     del llm
@@ -2552,6 +2557,7 @@ def main():
             "output_len": output_len,
             "num_iters": num_iters,
             "latencies": latencies,
+            "num_warmup": num_warmup,
         })
 
     with open(cfg["output_file"], "w") as f:
@@ -2656,6 +2662,23 @@ def _prepare_frozen_media(throughput, latency, seed, whisper=False):
     preload_media(throughput, latency, seed, loader, whisper)
 
 
+def _reference_results(raw):
+    """Reference-only results use the same schema, with absent FK fields."""
+    return {
+        "scenarios": [
+            {"scenario": row["name"], "vllm_elapsed": row["elapsed"],
+             "vllm_output_tokens": row["total_output_tokens"],
+             "vllm_tok_per_s": row["total_output_tokens"] / row["elapsed"]}
+            for row in raw.get("throughput", [])
+        ],
+        "latency_scenarios": [
+            {"scenario": row["name"], "vllm_latencies": row["latencies"],
+             "vllm_median_s": float(np.median(row["latencies"]))}
+            for row in raw.get("latency", [])
+        ],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Throughput & alignment benchmark: fastkernels baseline vs vLLM",
@@ -2692,6 +2715,8 @@ def main():
     )
     parser.add_argument("--enforce-eager", action="store_true", default=False)
     parser.add_argument("--skip-vllm", action="store_true")
+    parser.add_argument("--exclude-fastkernels", action="store_true",
+                        help="Measure only the vLLM reference worker")
     parser.add_argument(
         "--vllm-python",
         type=str,
@@ -2748,6 +2773,8 @@ def main():
     parser.add_argument("--reference-patches", choices=["auto", "off"], default="auto",
                         help="Apply existing validation reference workarounds, or run without them")
     args = parser.parse_args()
+    if args.skip_vllm and args.exclude_fastkernels:
+        parser.error("Cannot exclude both engines")
     if args.warmup_iters < 1 or args.latency_iters < 1:
         parser.error("Warmup and latency iteration counts must be positive")
     if args.max_num_seqs is not None and args.max_num_seqs < 1:
@@ -3243,6 +3270,43 @@ def main():
             print("  ERROR: vLLM reference subprocess failed.")
             sys.exit(1)
 
+    combined = {
+        "gpu": gpu,
+        "input_sha256": input_sha256,
+        "reference_patches": args.reference_patches,
+        "engine_env": engine_env,
+        "max_model_len": global_max_seq_len,
+        "max_num_seqs": engine_max_num_seqs,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "kv_cache_dtype": args.kv_cache_dtype,
+        "warmup_iters": args.warmup_iters, "dtype": args.dtype,
+        "media_inputs": __import__("fastkernels.validate.media_inputs", fromlist=["media_manifest"]).media_manifest(),
+        "model": args.model,
+        "model_type": (
+            "qwen_omni" if is_qwen_omni
+            else ("vlm" if is_vlm else "llm")
+        ),
+        "tp": args.tp,
+        "seed": args.seed,
+        "temperature": args.temperature,
+        "num_seqs": args.num_seqs,
+        "enforce_eager": args.enforce_eager,
+        "fastkernels_nccl_port": kb_nccl_port,
+        "vllm_flashinfer_socket_namespace": flashinfer_namespace,
+    }
+    if args.max_layers is not None:
+        combined["max_layers"] = args.max_layers
+    if vllm_port is not None:
+        combined["vllm_port"] = vllm_port
+
+    if args.exclude_fastkernels:
+        combined.update(_reference_results(vllm_raw))
+        if args.output_dir:
+            os.makedirs(args.output_dir, exist_ok=True)
+            with open(os.path.join(args.output_dir, "results.json"), "w") as f:
+                json.dump(combined, f, indent=2)
+        return
+
     # -- Run fastkernels (one subprocess, all scenarios) --
     kb_raw = None
     if args.resume and kb_raw_path:
@@ -3508,34 +3572,6 @@ def main():
     if args.output_dir and (all_results or latency_combined):
         os.makedirs(args.output_dir, exist_ok=True)
         results_path = os.path.join(args.output_dir, "results.json")
-        combined = {
-            "gpu": gpu,
-            "input_sha256": input_sha256,
-            "reference_patches": args.reference_patches,
-            "engine_env": engine_env,
-            "max_model_len": global_max_seq_len,
-            "max_num_seqs": engine_max_num_seqs,
-            "gpu_memory_utilization": args.gpu_memory_utilization,
-            "kv_cache_dtype": args.kv_cache_dtype,
-            "warmup_iters": args.warmup_iters, "dtype": args.dtype,
-            "media_inputs": __import__("fastkernels.validate.media_inputs", fromlist=["media_manifest"]).media_manifest(),
-            "model": args.model,
-            "model_type": (
-                "qwen_omni" if is_qwen_omni
-                else ("vlm" if is_vlm else "llm")
-            ),
-            "tp": args.tp,
-            "seed": args.seed,
-            "temperature": args.temperature,
-            "num_seqs": args.num_seqs,
-            "enforce_eager": args.enforce_eager,
-            "fastkernels_nccl_port": kb_nccl_port,
-            "vllm_flashinfer_socket_namespace": flashinfer_namespace,
-        }
-        if args.max_layers is not None:
-            combined["max_layers"] = args.max_layers
-        if vllm_port is not None:
-            combined["vllm_port"] = vllm_port
         if all_results:
             combined["scenarios"] = all_results
         if latency_combined:

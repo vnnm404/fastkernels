@@ -93,7 +93,7 @@ def _cache_env(cache_root: Path) -> dict[str, str]:
 
 def _make_job(index: int, scenario, harness: str, args, root: Path) -> dict:
     run_dir, log_path = _job_paths(root, index, scenario, harness)
-    return {
+    job = {
         "index": index,
         "name": scenario.hf_name,
         "draft_model": getattr(scenario, "draft_model", None),
@@ -106,6 +106,11 @@ def _make_job(index: int, scenario, harness: str, args, root: Path) -> dict:
         "log_path": str(log_path),
         "cache_root": str(_run_cache_root(root)),
     }
+
+    if getattr(args, "drift", False):
+        from .drift import configure_job
+        configure_job(job, args, root)
+    return job
 
 
 def _task_result_path(job: dict) -> Path:
@@ -203,6 +208,9 @@ def _plan_jobs(
         harness = _harness_for(
             scenario.hf_name, getattr(scenario, "draft_model", None)
         )
+        if getattr(args, "drift", False) and harness != "bench_vllm":
+            results[index] = f"SKIP(reference={harness or 'unmapped'})"
+            continue
         if harness is None:
             print(f"  - skip {scenario.hf_name}: no harness mapped")
             results[index] = "SKIP(no-harness)"
@@ -219,7 +227,7 @@ def _plan_jobs(
             results[index] = "SKIP(tp>gpus)"
             continue
         job = _make_job(index, scenario, harness, args, root)
-        cached_result = _load_cached_result(job) if args.resume else None
+        cached_result = _load_cached_result(job) if args.resume and not getattr(args, "drift", False) else None
         if cached_result is not None:
             print(
                 f"  {_c('cached', '32')} {scenario.hf_name}: "
@@ -460,6 +468,7 @@ def _run_job_subprocess(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
+    env.update(job.get("env", {}))
     env.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     env["FASTKERNELS_VALIDATE_JOB_INDEX"] = str(job["index"])
@@ -553,6 +562,9 @@ def _run_job_subprocess(
             pump.start()
             while proc.poll() is None:
                 now = time.monotonic()
+                if job.get("disk_root") and shutil.disk_usage(job["disk_root"]).free < job.get("min_free_bytes", 0):
+                    watchdog_reason = "scratch disk reserve exhausted"
+                    break
                 if timeout > 0 and now - start > timeout:
                     watchdog_reason = f"timeout after {timeout}s"
                     break
@@ -614,7 +626,7 @@ def _run_job_subprocess(
     # Every harness is expected to emit a machine-readable result artifact, so
     # treat its absence as a failure regardless of the exit code.
     if status == "PASS":
-        artifact = _result_artifact_path(run_dir, job.get("harness"))
+        artifact = run_dir / job["artifact"] if job.get("artifact") else _result_artifact_path(run_dir, job.get("harness"))
         if not artifact.is_file():
             status = "FAIL(no-results)"
             returncode = returncode or 1
@@ -656,6 +668,9 @@ def _ray_run_job(
     parent_visible_gpus: list[str],
     numactl_mode: str,
 ) -> dict:
+    if "drift" in job:
+        from .drift import run_job
+        return run_job(job, timeout, stall_timeout, repo_root, parent_visible_gpus, numactl_mode)
     return _run_job_subprocess(
         job,
         timeout,
@@ -1560,6 +1575,9 @@ def _format_coverage_gaps(coverage_gaps: list[dict]) -> str:
 
 def _write_summary(root: Path, scenarios, results: dict[int, str]) -> int:
     """Write summary.json and print the tables. Returns 1 on a coverage gap."""
+    if (root / "drift.json").exists():
+        from .drift_results import write_summary
+        return write_summary(root, scenarios, results)
     summary = _build_summary(root, scenarios, results)
     path = root / "summary.json"
     path.write_text(json.dumps(summary, indent=2) + "\n")
@@ -1655,6 +1673,8 @@ def _init_ray(ray, args):
         "ignore_reinit_error": True,
         "log_to_driver": False,
     }
+    if getattr(args, "drift", False):
+        kwargs["address"] = "local"
     if args.ray_address:
         return ray.init(address=args.ray_address, **kwargs)
     try:
@@ -1683,6 +1703,8 @@ def run_validation(scenarios, args, gpus: list[str], root: Path) -> int:
     jobs, results, cached = _plan_jobs(scenarios, args, len(gpus), root)
     root.mkdir(parents=True, exist_ok=True)
     scenario_name = _scenario_label(args.scenarios)
+    if getattr(args, "drift", False):
+        _write_summary(root, scenarios, results)
     for result in cached:
         task_name = _ray_job_id(scenario_name, result)
         _append_run_event(
@@ -1698,7 +1720,7 @@ def run_validation(scenarios, args, gpus: list[str], root: Path) -> int:
         rc = _print_summary(scenarios, results)
         # Coverage gaps fail the run too, so the summary must be written before
         # the run_finished status is decided.
-        rc = rc or _write_summary(root, scenarios, results)
+        rc = max(rc, _write_summary(root, scenarios, results))
         _append_run_event(
             root,
             {
@@ -1816,7 +1838,13 @@ def run_validation(scenarios, args, gpus: list[str], root: Path) -> int:
                         "elapsed_s": 0.0,
                         "error": repr(exc),
                     }
+                    if getattr(args, "drift", False):
+                        from .drift_results import write_json
+                        result["reason"] = repr(exc)
+                        write_json(Path(job["run_dir"]) / "results.json", result)
                 results[job["index"]] = status
+                if getattr(args, "drift", False):
+                    _write_summary(root, scenarios, results)
                 _append_run_event(
                     root,
                     {
@@ -1853,7 +1881,7 @@ def run_validation(scenarios, args, gpus: list[str], root: Path) -> int:
         for index in range(len(scenarios)):
             results.setdefault(index, "FAIL(cancelled)")
     rc = _print_summary(scenarios, results)
-    rc = rc or _write_summary(root, scenarios, results)
+    rc = max(rc, _write_summary(root, scenarios, results))
     _append_run_event(
         root,
         {

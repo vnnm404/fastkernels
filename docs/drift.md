@@ -9,6 +9,8 @@ compiler, Python development headers, and CUDA 13 installed. Replace
 git clone --branch drift-audit https://github.com/vnnm404/fastkernels.git
 cd fastkernels
 export FASTKERNELS_CACHE_DIR=/large-scratch/fastkernels-cache
+export TMPDIR="$FASTKERNELS_CACHE_DIR/tmp"
+mkdir -p "$TMPDIR"
 python3.12 -m fastkernels.validate.environments \
   --env-root "$FASTKERNELS_CACHE_DIR/reference-envs"
 source "$FASTKERNELS_CACHE_DIR/reference-envs/fk-env/bin/activate"

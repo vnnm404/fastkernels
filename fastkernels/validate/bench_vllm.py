@@ -34,6 +34,7 @@ import os
 import random
 import socket
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -129,7 +130,7 @@ def _reserve_tcp_port(preferred: int | None = None) -> tuple[int, object]:
 
     lock_dir = Path(os.environ.get(
         "FASTKERNELS_BENCH_PORT_LOCK_DIR",
-        "/tmp/fastkernels_bench_ports",
+        str(Path(tempfile.gettempdir()) / "fastkernels_bench_ports"),
     ))
     lock_dir.mkdir(parents=True, exist_ok=True)
 
@@ -234,7 +235,7 @@ def _install_bench_sitecustomize() -> None:
     """
     site_dir = Path(os.environ.get(
         "FASTKERNELS_FLASHINFER_SITECUSTOMIZE_DIR",
-        "/tmp/fastkernels_flashinfer_sitecustomize",
+        str(Path(tempfile.gettempdir()) / "fastkernels_flashinfer_sitecustomize"),
     ))
     site_dir.mkdir(parents=True, exist_ok=True)
     (site_dir / "sitecustomize.py").write_text(r'''

@@ -338,6 +338,41 @@ def test_shared_environment_defaults_do_not_create_cuda_contexts(monkeypatch):
     assert "direct_url.json" in calls[0][-1]
 
 
+@pytest.mark.parametrize("override", [False, True])
+def test_benchmark_helpers_respect_temp_directory(tmp_path, monkeypatch, override):
+    import importlib.util
+    import tempfile
+    from fastkernels.validate import _VALIDATE_DIR
+
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=object))
+    spec = importlib.util.spec_from_file_location("test_bench_paths", _VALIDATE_DIR / "bench_vllm.py")
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.delenv("FASTKERNELS_BENCH_PORT_LOCK_DIR", raising=False)
+    monkeypatch.delenv("FASTKERNELS_FLASHINFER_SITECUSTOMIZE_DIR", raising=False)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    locks = tmp_path / "fastkernels_bench_ports"
+    site = tmp_path / "fastkernels_flashinfer_sitecustomize"
+    if override:
+        locks, site = tmp_path / "custom-locks", tmp_path / "custom-site"
+        monkeypatch.setenv("FASTKERNELS_BENCH_PORT_LOCK_DIR", str(locks))
+        monkeypatch.setenv("FASTKERNELS_FLASHINFER_SITECUSTOMIZE_DIR", str(site))
+    port, lock = bench._reserve_tcp_port()
+    try:
+        assert (locks / f"{port}.lock").is_file()
+        other_port, other_lock = bench._reserve_tcp_port(preferred=port)
+        try:
+            assert other_port != port
+        finally:
+            other_lock.close()
+        bench._install_bench_sitecustomize()
+        assert (site / "sitecustomize.py").is_file()
+        assert os.environ["PYTHONPATH"] == str(site)
+    finally:
+        lock.close()
+
+
 @pytest.mark.parametrize("excluded", [False, True])
 def test_actual_harness_dispatch_excludes_only_requested_engine(
     tmp_path, monkeypatch, excluded

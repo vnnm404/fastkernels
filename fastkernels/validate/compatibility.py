@@ -138,6 +138,17 @@ def probe(config_dir):
             status="environment-error",
             reason=f"Config cannot load in this reference: {type(exc).__name__}: {exc}",
         )
+    if native:
+        try:
+            # Registration alone does not establish that the implementation can
+            # import on this GPU/environment. Inspect before downloading weights.
+            ModelRegistry.inspect_model_cls(architectures)
+        except Exception as exc:
+            return dict(
+                result,
+                status="environment-error",
+                reason=f"Native architecture inspection failed: {type(exc).__name__}: {exc}",
+            )
     if architectures and not native:
         # Do not preempt vLLM's normal auto fallback when the pinned config
         # loader supports the model. The actual validate run must establish fit.

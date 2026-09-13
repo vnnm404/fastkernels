@@ -19,6 +19,30 @@ class HubError(Exception):
 
 
 class CompatibilityTests(unittest.TestCase):
+    def test_native_architecture_is_inspected_before_reporting_support(self):
+        registry = SimpleNamespace(
+            get_supported_archs=lambda: ["MixtralForCausalLM"],
+            inspect_model_cls=Mock(side_effect=ValueError("invalid GPU UUID")),
+        )
+        modules = {
+            "torch": SimpleNamespace(zeros=lambda *a, **kw: SimpleNamespace(is_pinned=lambda: True)),
+            "vllm.model_executor.models": SimpleNamespace(ModelRegistry=registry),
+            "vllm.transformers_utils.config": SimpleNamespace(get_config=Mock()),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "config.json").write_text('{"architectures":["MixtralForCausalLM"]}')
+            with (
+                patch.dict(sys.modules, modules),
+                patch("importlib.metadata.version", return_value="test"),
+                patch("importlib.import_module"),
+            ):
+                result = compatibility.probe(tmp)
+                self.assertEqual(result["status"], "environment-error")
+                self.assertIn("invalid GPU UUID", result["reason"])
+                registry.inspect_model_cls.assert_called_once_with(["MixtralForCausalLM"])
+                registry.inspect_model_cls.side_effect = None
+                self.assertEqual(compatibility.probe(tmp)["status"], "ok")
+
     def test_different_concurrency_limits_cannot_be_compared(self):
         with self.assertRaisesRegex(ValueError, "max_num_seqs"):
             pair_metrics({"max_num_seqs": 128}, {"max_num_seqs": 512}, 32, [])

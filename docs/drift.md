@@ -82,3 +82,5 @@ attaching to an existing remote Ray cluster is not supported for drift.
 </details>
 
 [H100 diagnostic results: vLLM 0.18.0 vs 0.26.0](results/drift-h100-2026-09-13.md).
+
+[Two-H100 parallelism check](results/drift-2h100-parallel-2026-09-13.md).

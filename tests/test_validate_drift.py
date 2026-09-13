@@ -510,7 +510,7 @@ def test_driver_resume_rejects_changed_configuration(tmp_path, monkeypatch):
         drift.subprocess,
         "check_output",
         lambda cmd, **kw: (
-            "" if "--query-compute-apps=pid" in cmd else "GPU-test, B200, 180GB, driver"
+            "" if "--query-compute-apps=gpu_uuid,pid,used_memory" in cmd else "GPU-test, B200, 180GB, driver"
         ),
     )
     calls = []
@@ -528,3 +528,15 @@ def test_driver_resume_rejects_changed_configuration(tmp_path, monkeypatch):
     assert len(calls) == 2
     assert drift.main(argv + ["--resume", "--max-requests", "8"]) == 2
     assert len(calls) == 2
+
+
+def test_existing_gpu_memory_limit_is_per_gpu_and_sums_processes():
+    sample = "GPU-a, 1, 6000\nGPU-a, 2, 4000\nGPU-b, 3, 9000\n"
+    assert drift.check_existing_gpu_memory(sample, 10000) == {"GPU-a": 10000, "GPU-b": 9000}
+    with pytest.raises(ValueError, match="10000 MiB > 9999 MiB"):
+        drift.check_existing_gpu_memory(sample, 9999)
+    with pytest.raises(ValueError, match="exclusive allocation"):
+        drift.check_existing_gpu_memory("GPU-a, 1, 0", 0)
+    with pytest.raises(ValueError, match="Cannot determine"):
+        drift.check_existing_gpu_memory("GPU-a, 1, [N/A]", 10000)
+    assert drift.check_existing_gpu_memory("", 0) == {}

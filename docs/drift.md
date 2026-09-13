@@ -59,6 +59,12 @@ configurable with `--timeout` and `--stall-timeout`. CPU, disk, and host bandwid
 are shared; warmup does not eliminate interference. Serial-versus-concurrent GPU
 performance still needs validation before treating the parallel results as final.
 
+GPUs must be idle at startup by default. For an explicitly shared run,
+`--max-existing-gpu-memory-mib 10000` allows existing compute processes using
+at most 10,000 MiB in total per GPU. This checks startup only; it is not a
+reservation or an interference guarantee. Initial usage is recorded in
+`gpu-startup.json`.
+
 The runner pins checkpoint revisions, replays frozen inputs and decoded media,
 checks output budgets and throughput prefix agreement, and verifies artifacts
 before resuming. The prefix check is a heuristic, not proof of correctness.

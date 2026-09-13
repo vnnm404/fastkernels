@@ -500,6 +500,8 @@ def _parser(drift: bool = False):
         parser.add_argument("--alignment-floor", type=float, default=32)
         parser.add_argument("--min-free-gb", type=float, default=10)
         parser.add_argument("--keep-models", action="store_true")
+        parser.add_argument("--max-existing-gpu-memory-mib", type=int, default=0,
+                            help="Allow existing compute processes at startup up to this total MiB per GPU (default: require idle GPUs). This does not guarantee uncontested timings.")
     else:
         parser.add_argument("scenarios", help="Scenario path or packaged name")
     parser.add_argument("--max-requests", type=int, default=None)

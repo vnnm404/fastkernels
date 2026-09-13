@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import fcntl
 import json
 import os
@@ -29,6 +30,28 @@ from .drift_results import (
     read_validation,
     pair_metrics,
 )
+
+
+def check_existing_gpu_memory(output, limit):
+    """Require idle GPUs by default; optionally tolerate a bounded shared load."""
+    totals = {}
+    for row in csv.reader(output.splitlines()):
+        if not row:
+            continue
+        uuid, pid, memory = (item.strip() for item in row)
+        if limit == 0:
+            raise ValueError("Selected GPUs already have compute processes; use an exclusive allocation")
+        try:
+            used = int(memory)
+            if used < 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError(f"Cannot determine existing GPU memory for PID {pid}: {memory}") from None
+        totals[uuid] = totals.get(uuid, 0) + used
+    for uuid, used in totals.items():
+        if used > limit:
+            raise ValueError(f"Existing compute processes on {uuid} use {used} MiB > {limit} MiB")
+    return totals
 
 
 def configure_job(job, args, root):
@@ -296,6 +319,8 @@ def main(argv=None):
         "inf"
     ) or not 0 <= args.alignment_floor < float("inf"):
         parser.error("Disk reserve and alignment floor must be finite and nonnegative")
+    if args.max_existing_gpu_memory_mib < 0:
+        parser.error("--max-existing-gpu-memory-mib must be nonnegative")
     if args.max_requests is not None and args.max_requests < 1:
         parser.error("--max-requests must be positive")
     if not all(
@@ -385,16 +410,16 @@ def main(argv=None):
                     "nvidia-smi",
                     "-i",
                     ",".join(gpus),
-                    "--query-compute-apps=pid",
+                    "--query-compute-apps=gpu_uuid,pid,used_memory",
                     "--format=csv,noheader,nounits",
                 ],
                 text=True,
                 timeout=20,
             ).strip()
-            if busy:
-                raise ValueError(
-                    "Selected GPUs already have compute processes; use an exclusive allocation"
-                )
+            existing = check_existing_gpu_memory(busy, args.max_existing_gpu_memory_mib)
+            if args.max_existing_gpu_memory_mib:
+                print(f"Shared-GPU startup limit: {args.max_existing_gpu_memory_mib} MiB per GPU; existing usage: {existing}. Timings may be affected.", flush=True)
+            write_json(root / "gpu-startup.json", {"existing_memory_mib": existing, "limit_mib": args.max_existing_gpu_memory_mib})
             hardware = subprocess.check_output(
                 [
                     "nvidia-smi",
@@ -416,6 +441,7 @@ def main(argv=None):
                     "retries",
                     "alignment_floor",
                     "min_free_gb",
+                    "max_existing_gpu_memory_mib",
                     "keep_models",
                     "warmup_iters",
                     "latency_iters",

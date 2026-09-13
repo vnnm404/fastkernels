@@ -73,6 +73,27 @@ def test_worker_exception_survives_redirected_stderr(capfd):
     assert 'RuntimeError: worker failure evidence' in captured.err
 
 
+def test_worker_shared_helpers_in_uninstalled_reference_env(tmp_path, monkeypatch):
+    import venv
+    from fastkernels.validate.worker import run_worker
+
+    env = tmp_path / "reference"
+    venv.EnvBuilder(with_pip=False).create(env)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    result = run_worker(
+        'import json, sys, importlib.util\n'
+        'from fastkernels.validate.media_inputs import frozen_media\n'
+        'config = json.load(open(sys.argv[1]))\n'
+        'json.dump({"helper": callable(frozen_media), '
+        '"torch": importlib.util.find_spec("torch") is not None}, '
+        'open(config["output_file"], "w"))\n',
+        {}, "isolated reference", timeout=10,
+        python_executable=str(env / "bin" / "python"),
+    )
+    assert result == {"helper": True, "torch": False}
+
+
 def test_codestral_state_capacity_default_for_hopper_and_blackwell():
     import ast
     source = Path('fastkernels/validate/bench_vllm.py').read_text()

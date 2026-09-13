@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 
 def _terminate_process_group(pid: int) -> None:
@@ -107,6 +108,12 @@ def run_worker(
         print(f"{'─' * 70}", flush=True)
 
         env = os.environ.copy()
+        # Reference interpreters need our shared input helpers, but must retain
+        # their own dependencies. Expose only the source tree, not site-packages.
+        source_root = str(Path(__file__).resolve().parents[2])
+        env["PYTHONPATH"] = os.pathsep.join(
+            [source_root, *filter(None, env.get("PYTHONPATH", "").split(os.pathsep))]
+        )
         bindir = os.path.dirname(os.path.abspath(py))
         if bindir:
             env["PATH"] = bindir + os.pathsep + env.get("PATH", "")

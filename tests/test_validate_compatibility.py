@@ -20,9 +20,12 @@ class HubError(Exception):
 
 class CompatibilityTests(unittest.TestCase):
     def test_native_architecture_is_inspected_before_reporting_support(self):
+        implementation = SimpleNamespace(
+            inspect_model_cls=Mock(side_effect=ValueError("invalid GPU UUID")),
+        )
         registry = SimpleNamespace(
             get_supported_archs=lambda: ["MixtralForCausalLM"],
-            inspect_model_cls=Mock(side_effect=ValueError("invalid GPU UUID")),
+            models={"MixtralForCausalLM": implementation},
         )
         modules = {
             "torch": SimpleNamespace(zeros=lambda *a, **kw: SimpleNamespace(is_pinned=lambda: True)),
@@ -39,8 +42,8 @@ class CompatibilityTests(unittest.TestCase):
                 result = compatibility.probe(tmp)
                 self.assertEqual(result["status"], "environment-error")
                 self.assertIn("invalid GPU UUID", result["reason"])
-                registry.inspect_model_cls.assert_called_once_with(["MixtralForCausalLM"])
-                registry.inspect_model_cls.side_effect = None
+                implementation.inspect_model_cls.assert_called_once_with()
+                implementation.inspect_model_cls.side_effect = None
                 self.assertEqual(compatibility.probe(tmp)["status"], "ok")
 
     def test_different_concurrency_limits_cannot_be_compared(self):

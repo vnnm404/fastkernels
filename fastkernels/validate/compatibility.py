@@ -142,7 +142,8 @@ def probe(config_dir):
         try:
             # Registration alone does not establish that the implementation can
             # import on this GPU/environment. Inspect before downloading weights.
-            ModelRegistry.inspect_model_cls(architectures)
+            architecture = next(a for a in architectures if a in supported)
+            ModelRegistry.models[architecture].inspect_model_cls()
         except Exception as exc:
             return dict(
                 result,
